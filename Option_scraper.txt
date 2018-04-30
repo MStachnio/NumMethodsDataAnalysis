@@ -1,0 +1,228 @@
+#!/usr/bin/env python3
+
+# makes file executable for other programmes
+
+'''This programme webscrapes yahoo option chains and downloads all available information for any Ticker given,
+so long as it is listed on the Nasdaq. The information is then locally saved into a mysql database.
+
+This programme is installed on a ubuntu 16.04. cloud-server by DigitalOcean and relies on setting up the server
+such that it is compatible with this programme. To that end please consult the full documentation of setting up
+the "Web-Scrape Server"
+
+% DECLARATION OF AUTHORSHIP
+% We hereby certify that:
+% – We have written the program ourselves except for imported modules and clearly marked code.
+% – We have tested the program and it ran without crashing
+% Heng Mao, Rieger Sebastian, Stachnio Michal, van Impe Twinkel, Zocco Danilo,     2018-04-23
+%
+% maoheng@gmx.ch
+% sebastian.rieger@student.unisg.ch
+% michal.stachnio@student.unisg.ch
+% twinkel.vanimpe@student.unisg.ch
+% danilo.zocco@gmail.com
+
+Last update 2018-04-29
+'''
+##################################################################################
+#import modules
+from bs4 import BeautifulSoup
+import requests
+import pandas as pd
+import re
+from datetime import datetime
+import datetime as dt
+import time
+from sqlalchemy import create_engine
+
+#main function
+def option_scrape(Ticker, mysql_password):
+    #input list of Ticker-strings and your mysql password as string
+    for ticker in Ticker:
+        #webscrape for specific Ticker
+        df = option_chain(ticker)
+        #insert dataframe into mysql
+        dataframe_to_mysql(df, mysql_password)
+
+
+
+def dataframe_to_mysql(option_chain, mysql_password):
+    #connect to database, for a give mysql password
+    #this configurations were all set during server set up
+    dialect = "mysql+"
+    driver = "pymysql://"
+    username = "root:"
+    host_and_port = "@localhost"
+    database = "/financialdata"
+
+    #these inputs make up the SQLalchemy engine, which connect python to the databas
+    engine = create_engine(dialect + driver + username + mysql_password + host_and_port + database)
+
+    #input the dataframe into the database
+    option_chain.to_sql('option_chains', con =  engine, if_exists = 'append', index=True)
+
+
+def option_chain(Ticker):
+
+    #for a given ticker get all maturity dates for the option
+    maturities = get_all_maturities(Ticker)
+
+    #for a given ticker and for given maturity dates for the option, get all information from yahoo
+    #returns a list of lists
+    option_chain_list = get_all_options_all_maturities(Ticker, maturities)
+
+    #prepare for import to MySQL by putting option_chain_list into a pandas dataframe (specific format type)
+    # and label the columns
+    option_chain = pd.DataFrame(option_chain_list,columns=["Contract_Name", "Last_Day_Traded", "Strike", "Last_Price", "Bid", "Ask", "Volume", "Open_Interes$
+    #the Database_ID uniquely identifies entry into the dataframe
+    option_chain = option_chain.set_index("Database_ID")
+
+    return option_chain
+
+
+def get_all_maturities(Ticker):
+    #for a given ticker get all maturity dates for the option
+    #nasdaq site is easier than yahoo finance to find all maturites
+
+    #create list to input maturities
+    maturities = []
+    #download html
+    page = requests.get("https://www.nasdaq.com/symbol/" + Ticker + "/option-chain?dateindex=-1")
+    #for a given page, find the maturity
+    _get_maturity_from_nasdaq_page(page, maturities)
+
+    for i in range (2,6):
+        #there might be more maturities on other pages of that ticker
+        page = requests.get("https://www.nasdaq.com/symbol/" + Ticker + "/option-chain?dateindex=-1&page=" + str(i))
+        _get_maturity_from_nasdaq_page(page, maturities)
+    return maturities
+
+def _get_maturity_from_nasdaq_page(page, maturities):
+    #for a given page, find the maturity
+    soup = BeautifulSoup(page.content, "html.parser")
+    #search the processed html for the tray, wich includes the info we need
+    beginning_of_optionstable = soup.select('tr[class*="groupheader"]', limit = 1)
+    options_table = beginning_of_optionstable[0].find_next_siblings()
+
+    for sibling in options_table:
+        #search every element of the tray for maturities
+        try:
+            maturity = list(sibling.children)[1].get_text()
+            if maturity not in maturities:
+                #if new maturity then add to list of maturities
+                maturities.append(maturity)
+        except IndexError:
+            #if there is an error because the element of the tray doesn't include maturity, then skip the element
+            pass
+
+    return maturities
+
+
+
+def get_current_date_and_price_of_underlying(Ticker):
+    #for a given ticker get the adjusted close price of the underlying and the date we are retrieving
+    #the info from the "history" tab of yahoo finance
+    #download html
+    page = requests.get("https://finance.yahoo.com/quote/" + Ticker + "/history?p=" + Ticker)
+    #read-in html in a format convenient for further processing
+    soup = BeautifulSoup(page.content, "html.parser")
+    #search the processed html for the table, wich includes the info we need
+    histprices = soup.select('table[data-test*="historical-prices"]')
+
+    #get the entries we need from the specific parts of the table
+    adj_close = list(list(list(histprices[0].children)[1])[0].children)[5].get_text()
+    date_of_info = list(list(list(histprices[0].children)[1])[0].children)[0].get_text()
+
+    #put date and price into a list
+    date_and_underlying_price = []
+    date_and_underlying_price.append(date_of_info)
+    date_and_underlying_price.append(adj_close)
+
+    return date_and_underlying_price
+
+
+
+
+def get_all_options_all_maturities(Ticker, maturities):
+    #for a given ticker and for given list of maturity dates for the option, get all information from yahoo
+
+    #for a given ticker get the adjusted close price of the underlying and the date we are retrieving
+    #the info
+    date_and_underlying_price = get_current_date_and_price_of_underlying(Ticker)
+    adj_close = date_and_underlying_price[1]
+    date_of_info = date_and_underlying_price[0]
+
+    #set up list of lists with all data on one Ticker
+    all_options_of_ticker = []
+
+    for maturity in maturities:
+        #for every single maturity of a ticker get all option data
+        _get_all_options_of_one_maturity(Ticker, maturity, all_options_of_ticker, adj_close, date_of_info)
+
+    return all_options_of_ticker
+
+
+def _get_all_options_of_one_maturity(Ticker, maturity, all_options_of_ticker, adj_close, date_of_info):
+    #for a given ticker and for a given maturity date, get all information from yahoo
+    #need to change format of date and maturity (needed later for MySQL database)
+    date_of_info_as_timeobject = datetime.strptime(date_of_info,'%b %d, %Y')
+    maturity_as_datetimeobject = datetime.strptime(maturity,'%b %d, %Y')
+    #yahoo has one site for every maturity of a ticker. The maturities are passed in unix-time format. Convert:
+    unixtime_maturity = int(time.mktime(maturity_as_datetimeobject.timetuple()) + 7200)
+    #download html
+    page = requests.get("https://finance.yahoo.com/quote/" + Ticker + "/options?p=" + Ticker + "&date=" + str(unixtime_maturity))
+    #read-in html in a format convenient for further processing
+    soup = BeautifulSoup(page.content, "html.parser")
+    #search the processed html for the tray, wich includes the info we need
+    all_options = soup.select('tr[class*="data-row"]')
+    #bring up the list with all options info that has been aquired so far
+    all_options_of_tick = all_options_of_ticker
+
+    for strike in list(all_options):
+        #set up list with new entry for the options chain (i.e. a new "row" in the options chain)
+        b = []
+
+        for child in list(strike.children):
+            #take the info from the tray and put into list
+            b.append(child.get_text())
+
+        #need to change format of time-traded
+        b[1] = b[1][0:10]
+
+        #don't need the variables "change" or "percentage change" - take them back out of list
+        del b[6:8]
+
+        #need to change the format of implied volatility
+        b[8] = (b[8][:len(b[8])-1])
+
+        #add additional additional info to the list
+        b.append(adj_close)
+        b.append(date_of_info_as_timeobject.strftime('%Y-%m-%d'))
+        b.append(maturity_as_datetimeobject.strftime('%Y-%m-%d'))
+        b.append(Ticker)
+
+        #create and add a unique identifying options ID - consists of date and option contract
+        unixtime_date_of_info = int(time.mktime(date_of_info_as_timeobject.timetuple()))
+        b.append(b[0] + str(unixtime_date_of_info))
+
+        #Is option put or call? -> find out with word search function rexexp
+        regexp = re.compile('\d\d\d\d\d\dP')
+        regexp.search(b[0])
+        if regexp.search(b[0]) is not None:
+            b.append("Put")
+        else:
+            b.append("Call")
+
+        #add this new "row" of the option chain to the entire option chain
+        all_options_of_tick.append(b)
+
+    return all_options_of_tick
+
+
+########################################################################
+#CALL THE FUNCTION
+#Insert desired Nasdaq tickers and your MySQL password
+
+option_scrape(["AAPL", "FB", "GOOG", "YOUR_FAVOURITE_NASDAQ_TICKER"], "YOUR_PASSWORD_FOR_MYSQL")
+
+
+
